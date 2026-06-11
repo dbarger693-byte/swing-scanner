@@ -1,6 +1,6 @@
-'''Swing trading engine — consolidated single file for easy GitHub mobile upload.
-See README in the full project zip for design notes and limitations.'''
+'''Swing trading engine — consolidated single file for easy GitHub mobile upload.'''
 import os
+import time
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
@@ -81,51 +81,103 @@ EARNINGS_VETO_DAYS = 7           # exclude signals with earnings within N days
 # ======================================================================
 # data.py
 # ======================================================================
-"""Data layer. MVP uses yfinance (free, daily bars, survivorship-biased — see
-DESIGN_CRITIQUE.md #3). Production swaps this module for Polygon.io without
-touching the rest of the system: keep the same get_history() contract."""
+"""Data layer. Tries yfinance first; if Yahoo blocks the request (common on
+cloud hosts like Streamlit Cloud), falls back to Stooq's free daily-data CSV
+endpoint. Both are survivorship-biased — see DESIGN_CRITIQUE.md #3. Production
+swaps this module for Polygon.io: keep the same get_history() contract."""
 
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+
 
 def _cache_path(ticker: str) -> str:
-    return os.path.join(CACHE_DIR, f"{ticker}.parquet")
+    return os.path.join(CACHE_DIR, f"{ticker}.csv")
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df[OHLCV].dropna()
+    df.index = pd.to_datetime(df.index)
+    try:
+        df.index = df.index.tz_localize(None)
+    except TypeError:
+        pass
+    return df.sort_index()
+
+
+def _from_yfinance(ticker: str, period: str) -> pd.DataFrame:
+    import yfinance as yf
+    df = yf.download(ticker, period=period, auto_adjust=True,
+                     progress=False, threads=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):  # newer yfinance versions
+        df.columns = df.columns.get_level_values(0)
+    df = df.loc[:, ~df.columns.duplicated()]
+    if not set(OHLCV).issubset(df.columns):
+        return pd.DataFrame()
+    return _clean(df)
+
+
+def _from_stooq(ticker: str, bars: int = 780) -> pd.DataFrame:
+    """Stooq free daily CSV — reliable from cloud IPs, no key needed."""
+    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
+    try:
+        df = pd.read_csv(url)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty or "Close" not in df.columns:
+        return pd.DataFrame()
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date")
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
+    return _clean(df).tail(bars)  # ~3 years of trading days
 
 
 def get_history(ticker: str, period: str = "3y", refresh: bool = False) -> pd.DataFrame:
-    """Return daily OHLCV with columns: Open, High, Low, Close, Volume.
-    Cached to parquet so repeated scans don't hammer the data source."""
+    """Daily OHLCV with columns Open/High/Low/Close/Volume, parquet-cached."""
     path = _cache_path(ticker)
     if not refresh and os.path.exists(path):
-        df = pd.read_parquet(path)
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
         if len(df) > 250:
             return df
-    import yfinance as yf
-    df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    df.to_parquet(path)
+    df = pd.DataFrame()
+    try:
+        df = _from_yfinance(ticker, period)
+    except Exception:
+        pass
+    if df.empty or len(df) < 250:
+        alt = _from_stooq(ticker)
+        if len(alt) > len(df):
+            df = alt
+    if df.empty:
+        return df
+    df.to_csv(path)
     return df
 
 
-def get_universe_data(tickers, period: str = "3y", refresh: bool = False) -> dict:
+def get_universe_data(tickers, period: str = "3y", refresh: bool = False,
+                      progress_cb=None) -> dict:
     out = {}
-    for t in tickers:
+    for k, t in enumerate(tickers):
         try:
             df = get_history(t, period=period, refresh=refresh)
             if len(df) > 250:
                 out[t] = df
         except Exception as e:  # one bad ticker shouldn't kill the scan
             print(f"[data] skipped {t}: {e}")
+        if progress_cb:
+            progress_cb(k + 1, len(tickers), t)
+        time.sleep(0.05)  # be polite to free endpoints
     return out
 
 
 def next_earnings_date(ticker: str):
-    """Best-effort earnings date from yfinance. Returns pd.Timestamp or None."""
+    """Best-effort earnings date from yfinance. Returns pd.Timestamp or None.
+    Silently returns None when Yahoo is unreachable (e.g., cloud hosts)."""
     try:
         import yfinance as yf
         cal = yf.Ticker(ticker).calendar
